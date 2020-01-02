@@ -1791,8 +1791,8 @@ let rec tc_lexpr (env: Env.t) (u: unifier) (loc: AST.l) (ty: AST.ty) (x: AST.lex
     )
 
 (** Typecheck list of statements *)
-let rec tc_stmts (env: Env.t) (loc: AST.l) (xs: AST.stmt list): AST.stmt list =
-    let rss = Env.nest (fun env' -> List.map (fun s ->
+let rec tc_stmts_with_bindings (env: Env.t) (loc: AST.l) (xs: AST.stmt list): (AST.stmt list * ((AST.ident * AST.ty) list)) =
+    let (rss, bs) = Env.nest_with_bindings (fun env' -> List.map (fun s ->
         let s' = tc_stmt env' s in
         let imps = Env.getImplicits env' in
         List.iter (fun (v, ty) -> Env.addLocalVar env' loc v ty) imps;
@@ -1801,7 +1801,10 @@ let rec tc_stmts (env: Env.t) (loc: AST.l) (xs: AST.stmt list): AST.stmt list =
         List.append decls [s']
     ) xs
     ) env in
-    List.concat rss
+    (List.concat rss, bs)
+
+and tc_stmts (env: Env.t) (loc: AST.l) (xs: AST.stmt list): AST.stmt list =
+    fst (tc_stmts_with_bindings env loc xs)
 
 (** Typecheck 'if expr then stmt' *)
 and tc_s_elsif (env: Env.t) (loc: AST.l) (x: AST.s_elsif): AST.s_elsif =
@@ -2070,14 +2073,7 @@ let tc_encoding (env: Env.t) (x: encoding): (encoding * ((AST.ident * AST.ty) li
             Env.addLocalVar env loc fnm (type_bits (Expr_LitInt (string_of_int wd)))
         ) fields;
         let guard' = check_expr env loc type_bool guard in
-        let (b', bs) = Env.nest_with_bindings (fun env' ->
-            let b' = tc_stmts env' loc b in
-            let imps = Env.getAllImplicits env in
-            List.iter (fun (v, ty) -> Env.addLocalVar env' loc v ty) imps;
-            let decls = declare_implicits loc imps in
-            if verbose && decls <> [] then Printf.printf "Implicit decls: %s %s" (pp_loc loc) (Utils.to_string (PP.pp_indented_block decls));
-            List.append decls b'
-        ) env in
+        let (b', bs) = tc_stmts_with_bindings env loc b in
         (Encoding_Block (nm, iset, fields, opcode, guard', unpreds, b', loc), bs)
     )
 
@@ -2326,7 +2322,13 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             (* todo: ponder what to do when encodings don't all define the same variables *)
             List.iter (fun vs -> List.iter (fun (v, ty) -> Env.addLocalVar locals loc v ty) vs) vss;
 
-            let opost' = map_option (tc_stmts locals loc) opost in
+            let (opost', pvs) =
+                match (map_option (tc_stmts_with_bindings locals loc) opost) with
+                | Some (opost', pvs) -> (Some opost', pvs)
+                | None -> (None, [])
+            in
+            List.iter (fun (v, ty) -> Env.addLocalVar locals loc v ty) pvs;
+
             let exec' = tc_stmts locals loc exec in
             [Decl_InstructionDefn(nm, encs', opost', conditional, exec', loc)]
     | Decl_DecoderDefn(nm, case, loc) ->
