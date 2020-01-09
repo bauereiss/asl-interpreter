@@ -256,6 +256,22 @@ class substFunClass (replace: ident -> expr option) = object
         )
 end
 
+let subst_fun_expr (replace: ident -> expr option) (x: expr): expr =
+    let subst = new substFunClass replace in
+    visit_expr subst x
+
+let subst_fun_lexpr (replace: ident -> expr option) (x: lexpr): lexpr =
+    let subst = new substFunClass replace in
+    visit_lexpr subst x
+
+let subst_fun_slice (replace: ident -> expr option) (x: slice): slice =
+    let subst = new substFunClass replace in
+    visit_slice subst x
+
+let subst_fun_type (replace: ident -> expr option) (x: ty): ty =
+    let subst = new substFunClass replace in
+    visit_type subst x
+
 (****************************************************************)
 (** {2 Expression transformation}                               *)
 (****************************************************************)

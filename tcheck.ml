@@ -260,6 +260,8 @@ module GlobalEnv : sig
     val isEncoding          : t -> AST.ident -> bool
     val addGlobalVar        : t -> AST.l -> AST.ident -> AST.ty -> bool -> unit
     val getGlobalVar        : t -> AST.ident -> AST.ty option
+    val addConstant         : t -> AST.ident -> AST.expr -> unit
+    val getConstant         : t -> AST.ident -> AST.expr option
 end = struct
     type t = {
         mutable types       : typedef Bindings.t;
@@ -269,6 +271,7 @@ end = struct
         mutable operators2  : (funtype list) Operators2.t;
         mutable encodings   : IdentSet.t;
         mutable globals     : AST.ty Bindings.t;
+        mutable constants   : AST.expr Bindings.t;
     }
 
     let mkempty _: t = {
@@ -279,6 +282,7 @@ end = struct
         operators2  = Operators2.empty;
         encodings   = IdentSet.empty;
         globals     = Bindings.empty;
+        constants   = Bindings.empty;
     }
 
     let addType (env: t) (loc: AST.l) (qid: AST.ident) (t: typedef): unit =
@@ -350,7 +354,26 @@ end = struct
     let getGlobalVar (env: t) (v: AST.ident): AST.ty option =
         (* Printf.printf "Looking for global variable %s\n" (pprint_ident v); *)
         Bindings.find_opt v env.globals
+
+    let getConstant (env: t) (v: AST.ident): AST.expr option =
+        Bindings.find_opt v env.constants
+
+    let addConstant (env: t) (v: AST.ident) (e: AST.expr): unit =
+        let e' = subst_fun_expr (getConstant env) e in
+        env.constants <- Bindings.add v e' env.constants
 end
+
+let subst_consts_expr (env: GlobalEnv.t) (e: AST.expr): AST.expr =
+    subst_fun_expr (GlobalEnv.getConstant env) e
+
+let subst_consts_type (env: GlobalEnv.t) (ty: AST.ty): AST.ty =
+    subst_fun_type (GlobalEnv.getConstant env) ty
+
+let isConstant (env: GlobalEnv.t) (v: AST.ident): bool =
+    GlobalEnv.getConstant env v <> None
+
+let removeConsts (env: GlobalEnv.t) (ids: IdentSet.t) =
+    IdentSet.filter (fun v -> not (isConstant env v)) ids
 
 (** dereference typedef *)
 let rec derefType (env: GlobalEnv.t) (ty: AST.ty): AST.ty =
@@ -580,6 +603,9 @@ end = struct
         (r, locals)
 
     let addLocalVar (env: t) (loc: AST.l) (v: AST.ident) (ty: AST.ty): unit =
+        if (GlobalEnv.getConstant (env.globals) v <> None) then begin
+            raise (TypeError (loc, pprint_ident v ^ " already declared as global constant"))
+        end;
         (* Printf.printf "New local var %s : %s at %s\n" (pprint_ident v) (ppp_type ty) (pp_loc loc); *)
         (match env.locals with
         | (bs :: bss) -> env.locals <- (Bindings.add v ty bs) :: bss
@@ -588,6 +614,8 @@ end = struct
         env.modified <- IdentSet.add v env.modified
 
     let addLocalImplicitVar (env: t) (loc: AST.l) (v: AST.ident) (ty: AST.ty): unit =
+        (* Should only be called for undeclared variables *)
+        assert (GlobalEnv.getConstant (env.globals) v = None);
         (* Printf.printf "New implicit: %s : %s\n" (pprint_ident v) (ppp_type ty); *)
         env.implicits := Bindings.add v ty !(env.implicits);
         env.modified <- IdentSet.add v env.modified
@@ -996,7 +1024,11 @@ let unify_ixtype (u: unifier) (ty1: AST.ixtype) (ty2: AST.ixtype): unit =
  *)
 (* todo: does not handle register<->bits coercions *)
 let rec unify_type (env: GlobalEnv.t) (u: unifier) (ty1: AST.ty) (ty2: AST.ty): unit =
-    (match (derefType env ty1, derefType env ty2) with
+    (* Substitute global constants in types *)
+    let subst_consts = new substFunClass (GlobalEnv.getConstant env) in
+    let ty1' = Asl_visitor.visit_type subst_consts ty1 in
+    let ty2' = Asl_visitor.visit_type subst_consts ty2 in
+    (match (derefType env ty1', derefType env ty2') with
     | (Type_Constructor c1,       Type_Constructor c2)       -> ()
     | (Type_Bits(e1),             Type_Bits(e2))             -> u#addEquality e1 e2
     | (Type_App (c1, es1),        Type_App (c2, es2))        -> u#addEqualities es1 es2
@@ -1155,7 +1187,7 @@ let instantiate_fun (env: GlobalEnv.t) (u: unifier) (loc: AST.l) (fty: funtype) 
 
     (* Add bindings for every explicit type argument *)
     assert ((List.length atys) == (List.length es));
-    List.iter2 (fun (_, v) e -> if List.mem v tvs then u#addEquality (Expr_Var v) e) atys es;
+    List.iter2 (fun (_, v) e -> if List.mem v tvs then u#addEquality (Expr_Var v) (subst_consts_expr env e)) atys es;
 
     (* unify argument types *)
     assert ((List.length atys) == (List.length tys));
@@ -1172,7 +1204,7 @@ let instantiate_sfun (env: GlobalEnv.t) (u: unifier) (loc: AST.l) (fty: sfuntype
     assert ((List.length atys) == (List.length es));
     List.iter2 (fun aty e ->
         let v = sformal_var aty in
-        if List.mem v tvs then u#addEquality (Expr_Var v) e
+        if List.mem v tvs then u#addEquality (Expr_Var v) (subst_consts_expr env e)
     ) atys es;
 
     (* unify argument types *)
@@ -2189,10 +2221,11 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             let ty' = tc_type (Env.mkEnv env) loc ty in
             let i'  = check_expr (Env.mkEnv env) loc ty' i in
             GlobalEnv.addGlobalVar env loc qid ty' true;
+            GlobalEnv.addConstant env qid (simplify_expr i');
             [Decl_Const(ty', qid, i', loc)]
     | Decl_BuiltinFunction(rty, qid, atys, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_funtype (qid, false, [], [], atys, rty) in
+            let tvs = fv_funtype (qid, false, [], [], atys, rty) |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let rty'  = tc_type locals loc rty in
             let atys' = tc_arguments locals loc atys in
@@ -2200,7 +2233,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_BuiltinFunction(rty', qid', atys', loc)]
     | Decl_FunType(rty, qid, atys, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_funtype (qid, false, [], [], atys, rty) in
+            let tvs = fv_funtype (qid, false, [], [], atys, rty) |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let rty'  = tc_type      locals loc rty in
             let atys' = tc_arguments locals loc atys in
@@ -2208,7 +2241,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_FunType(rty', qid', atys', loc)]
     | Decl_FunDefn(rty, qid, atys, b, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_funtype (qid, false, [], [], atys, rty) in
+            let tvs = fv_funtype (qid, false, [], [], atys, rty) |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let rty'  = tc_type      locals loc rty in
             let atys' = tc_arguments locals loc atys in
@@ -2218,14 +2251,14 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_FunDefn(rty', qid', atys', b', loc)]
     | Decl_ProcType(qid, atys, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_args atys in
+            let tvs = fv_args atys |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let atys' = tc_arguments locals loc atys in
             let qid'  = ft_id (addFunction env loc qid false tvs atys' type_unit) in
             [Decl_ProcType(qid', atys', loc)]
     | Decl_ProcDefn(qid, atys, b, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_args atys in
+            let tvs = fv_args atys |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let atys' = tc_arguments locals loc atys in
             let b'    = tc_body locals loc b in
@@ -2233,7 +2266,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_ProcDefn(qid', atys', b', loc)]
     | Decl_VarGetterType(rty, qid, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_type rty in
+            let tvs = fv_type rty |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let rty' = tc_type locals loc rty in
             (* todo: check that if a setter function exists, it has a compatible type *)
@@ -2241,7 +2274,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_VarGetterType(rty', qid', loc)]
     | Decl_VarGetterDefn(rty, qid, b, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_type rty in
+            let tvs = fv_type rty |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let rty' = tc_type locals loc rty in
             (* todo: check that if a setter function exists, it has a compatible type *)
@@ -2251,7 +2284,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_VarGetterDefn(rty', qid', b', loc)]
     | Decl_ArrayGetterType(rty, qid, atys, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_funtype (qid, false, [], [], atys, rty) in
+            let tvs = fv_funtype (qid, false, [], [], atys, rty) |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let rty'  = tc_type      locals loc rty in
             let atys' = tc_arguments locals loc atys in
@@ -2260,7 +2293,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_ArrayGetterType(rty', qid', atys', loc)]
     | Decl_ArrayGetterDefn(rty, qid, atys, b, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_funtype (qid, false, [], [], atys, rty) in
+            let tvs = fv_funtype (qid, false, [], [], atys, rty) |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let rty'  = tc_type      locals loc rty in
             let atys' = tc_arguments locals loc atys in
@@ -2271,7 +2304,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_ArrayGetterDefn(rty', qid', atys', b', loc)]
     | Decl_VarSetterType(qid, ty, v, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_type ty in
+            let tvs = fv_type ty |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let ty'   = tc_type locals loc ty in
             Env.addLocalVar locals loc v ty';
@@ -2281,7 +2314,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_VarSetterType(qid', ty', v, loc)]
     | Decl_VarSetterDefn(qid, ty, v, b, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = fv_type ty in
+            let tvs = fv_type ty |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let ty'   = tc_type locals loc ty in
             Env.addLocalVar locals loc v ty';
@@ -2292,7 +2325,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_VarSetterDefn(qid', ty', v, b', loc)]
     | Decl_ArraySetterType(qid, atys, ty, v, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = IdentSet.union (fv_sformals atys) (fv_type ty) in
+            let tvs = IdentSet.union (fv_sformals atys) (fv_type ty) |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let atys' = tc_sformals locals loc atys in
             let ty'   = tc_type     locals loc ty in
@@ -2302,7 +2335,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_ArraySetterType(sft_id qid', atys', ty', v, loc)]
     | Decl_ArraySetterDefn(qid, atys, ty, v, b, loc) ->
             let locals = Env.mkEnv env in
-            let tvs = IdentSet.union (fv_sformals atys) (fv_type ty) in
+            let tvs = IdentSet.union (fv_sformals atys) (fv_type ty) |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let atys' = tc_sformals locals loc atys in
             let ty'   = tc_type     locals loc ty in
@@ -2352,7 +2385,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             [Decl_Operator2(op, List.map ft_id funs', loc)]
     | Decl_NewEventDefn(qid, atys, loc) -> (* very similar to Decl_ProcType *)
             let locals = Env.mkEnv env in
-            let tvs = fv_args atys in
+            let tvs = fv_args atys |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let atys' = tc_arguments locals loc atys in
             let qid'  = ft_id (addFunction env loc qid false tvs atys' type_unit) in
@@ -2372,7 +2405,7 @@ let tc_declaration (env: GlobalEnv.t) (d: AST.declaration): AST.declaration list
             )
     | Decl_NewMapDefn(rty, qid, atys, b, loc) -> (* very similar to Decl_FunDefn *)
             let locals = Env.mkEnv env in
-            let tvs = fv_funtype (qid, false, [], [], atys, rty) in
+            let tvs = fv_funtype (qid, false, [], [], atys, rty) |> removeConsts env in
             IdentSet.iter (fun tv -> Env.addLocalVar locals loc tv type_integer) tvs;
             let rty'  = tc_type      locals loc rty in
             Env.setReturnType locals rty';
